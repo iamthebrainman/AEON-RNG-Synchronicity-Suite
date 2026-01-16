@@ -32,6 +32,7 @@ The heart of the AEON suite is the **Random Number Visualizer** (`RandomNumberVi
 - **Synchronicity Status**: Dynamic indicators (ORDERED, SYNCHRONICITY!) based on real-time spectral entropy and drift analysis.
 
 ---
+<img width="827" height="1080" alt="Screenshot 2026-01-08 214321" src="https://github.com/user-attachments/assets/f2084c03-7aa6-415f-a8c8-128528bc61e9" />
 
 ## 🔮 Multi-Dimensional Calibration
 
@@ -76,4 +77,5 @@ AEON automatically logs all sessions to the `rng_logs/` directory.
 <div align="center">
 Developed for the exploration of the intersection between intent and entropy.
 </div>
+
 
