@@ -1,6 +1,7 @@
 <div align="center">
 
-![AEON Hero Image](C:/Users/johnv/.gemini/antigravity/brain/e18c903d-cb72-4fbb-b828-cf85ab66baa3/aeon_hero_image_1768528844382.png)
+<img width="1920" height="1008" alt="Screenshot 2026-01-07 011039" src="https://github.com/user-attachments/assets/91308fcd-4faf-4b58-bbfe-f3f7ec4258cd" />
+
 
 # AEON: RNG Synchronicity Suite
 ### *Advanced Entropy Monitoring \u0026 Calibration for Parapsychological Research*
@@ -75,3 +76,4 @@ AEON automatically logs all sessions to the `rng_logs/` directory.
 <div align="center">
 Developed for the exploration of the intersection between intent and entropy.
 </div>
+
