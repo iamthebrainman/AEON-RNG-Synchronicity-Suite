@@ -15,6 +15,10 @@ from scipy.stats import chisquare
 from scipy.signal import correlate, welch
 from tkinter import simpledialog  # For session name prompt
 from CalibrationMode import CalibrationWindow  # Calibration popup
+from entropy_sources import OsEntropySource, Esp32NodeSource
+import firmware_gen
+import tkinter.messagebox as mbox
+import threading
 
 # --- CONFIGURATION ---
 WINDOW_SIZE = 1000   # How many bits to keep in the "probability" window
@@ -44,6 +48,10 @@ class RNGFluctuationMeter:
         self.session_name = session_name
         # Total bits emitted since start (monotonic counter)
         self.total_bits = 0
+
+        # --- ENTROPY SOURCE SETUP ---
+        self.entropy_source = OsEntropySource()
+        self.entropy_source.open()
 
         # --- LAYOUT: CONTROLS FIRST (BOTTOM) ---
         self.controls_frame = tk.Frame(root, bg="#1e1e1e", bd=2, relief=tk.RAISED)
@@ -106,10 +114,25 @@ class RNGFluctuationMeter:
                                            selectcolor="#2d2d2d", activebackground="#1e1e1e")
         self.reverse_check.pack(side=tk.LEFT, padx=5)
 
-        # STATS / DIAGNOSTICS LABEL
         self.label = tk.Label(self.controls_frame, text="Ready", font=("Courier", 11, "bold"), 
                               bg="#1e1e1e", fg="#00ff00", justify=tk.LEFT)
         self.label.pack(side=tk.RIGHT, padx=10)
+
+        # --- MENU BAR ---
+        self.menubar = tk.Menu(root)
+        self.root.config(menu=self.menubar)
+        
+        self.device_menu = tk.Menu(self.menubar, tearoff=0)
+        self.menubar.add_cascade(label="Source", menu=self.device_menu)
+        self.device_menu.add_command(label="Use OS Entropy (/dev/urandom)", command=self.set_source_os)
+        # NOTE: ESP32 network node support is experimental. See README and
+        # `esp32_firmware/README.md` for known connection-stability issues and
+        # troubleshooting steps (router settings, DHCP reservations, UDP/firewall).
+        self.device_menu.add_command(label="Use ESP32 Network Nodes", command=self.set_source_esp32)
+        self.device_menu.add_separator()
+        self.device_menu.add_command(label="Generate ESP32 Firmware...", command=self.open_firmware_gen)
+        self.device_menu.add_separator()
+        self.device_menu.add_command(label="📊 Open Pop-out Waterfall", command=self.open_waterfall_popup)
 
         # --- MAGNITUDE BAR (DEVIATION GAUGE) ---
         self.mag_frame = tk.Frame(root, bg="#1e1e1e")
@@ -212,6 +235,32 @@ class RNGFluctuationMeter:
         pattern_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.pattern_tree.configure(yscrollcommand=pattern_scroll.set)
         
+        # --- TAB 4: NODE STATUS (ESP32) ---
+        node_frame = tk.Frame(self.anomaly_notebook, bg="#1e1e1e")
+        self.anomaly_notebook.add(node_frame, text="Node Status")
+        
+        node_tree_frame = tk.Frame(node_frame, bg="#1e1e1e")
+        node_tree_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.node_tree = ttk.Treeview(node_tree_frame, columns=('ID', 'Status', 'Bitrate', 'Last Seen', 'Source IP'), 
+                                     height=15, show='headings')
+        self.node_tree.heading('ID', text='Node ID')
+        self.node_tree.heading('Status', text='Status')
+        self.node_tree.heading('Bitrate', text='Bitrate')
+        self.node_tree.heading('Last Seen', text='Last Seen')
+        self.node_tree.heading('Source IP', text='Source IP')
+        self.node_tree.column('ID', width=70)
+        self.node_tree.column('Status', width=70)
+        self.node_tree.column('Bitrate', width=80)
+        self.node_tree.column('Last Seen', width=80)
+        self.node_tree.column('Source IP', width=100)
+        self.node_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        node_scroll = ttk.Scrollbar(node_tree_frame, orient=tk.VERTICAL, 
+                                   command=self.node_tree.yview)
+        node_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.node_tree.configure(yscrollcommand=node_scroll.set)
+        
         # Keep reference to old anomaly_tree for backward compatibility
         self.anomaly_tree = self.stat_tree  # Default to statistical tab
         
@@ -219,6 +268,28 @@ class RNGFluctuationMeter:
         self.drift_label = tk.Label(self.right_panel, text="Freq Drift: 0.0000 Hz/s", 
                                    bg="#1e1e1e", fg="#00ff00", font=("Courier", 9, "bold"))
         self.drift_label.pack(pady=5)
+
+        # --- FFT sensitivity & display controls ---
+        fft_ctrl = tk.Frame(self.right_panel, bg="#1e1e1e")
+        fft_ctrl.pack(pady=5, fill=tk.X)
+
+        tk.Label(fft_ctrl, text="Bins:", bg="#1e1e1e", fg="#aaaaaa").pack(side=tk.LEFT, padx=(5,0))
+        self.waterfall_bins = 64
+        self.bins_scale = tk.Scale(fft_ctrl, from_=16, to=128, orient=tk.HORIZONTAL, bg="#2d2d2d", fg="white",
+                                  command=lambda v: self.set_waterfall_bins(int(v)))
+        self.bins_scale.set(64)
+        self.bins_scale.pack(side=tk.LEFT, padx=5)
+
+        self.auto_center_waterfall = False
+        self.auto_center_var = tk.BooleanVar(value=False)
+        self.auto_center_check = tk.Checkbutton(fft_ctrl, text="Auto-center", variable=self.auto_center_var,
+                            command=lambda: setattr(self, 'auto_center_waterfall', self.auto_center_var.get()),
+                            bg="#1e1e1e", fg="#aaaaaa", selectcolor="#2d2d2d")
+        self.auto_center_check.pack(side=tk.LEFT, padx=5)
+        
+        self.popout_btn = tk.Button(fft_ctrl, text="📊 Pop-out", command=self.open_waterfall_popup,
+                                   bg="#449944", fg="white", font=("Arial", 8, "bold"))
+        self.popout_btn.pack(side=tk.RIGHT, padx=5)
 
         # --- DATA SETUP ---
         # Anomaly tracking
@@ -233,12 +304,23 @@ class RNGFluctuationMeter:
         self.p_history = deque(maxlen=300)
         self.cumulative_history = deque(maxlen=300)
         
+        # Timing diagnostics for fluctuation investigation
+        self.last_tick_time = time.time()
+        self.tick_deltas = deque(maxlen=1000)
+        self.bit_rate_history = deque(maxlen=1000)
+        
+        # Center-band oscillation tracking
+        self.mid_band_history = deque(maxlen=4000) # ~200 seconds at 20fps
+        self.last_osc_check = time.time()
+        
         # FFT baseline for anomaly detection
         self.fft_baseline_mean = None   # np.array of shape (64,)
         self.fft_baseline_var = None    # np.array of shape (64,)
         self.fft_baseline_alpha = 0.01  # EMA smoothing factor
         self.fft_frame_counter = 0      # Throttle FFT anomaly checks
         self.last_fft_anomaly_time = 0  # Debounce FFT-PATTERN logging
+        self.auto_center_waterfall = False
+        self.waterfall_popup = None
 
         # Pattern Memory
         self.patterns_history = self.load_patterns()
@@ -294,6 +376,9 @@ class RNGFluctuationMeter:
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
+        # Make FFT clickable
+        self.canvas.mpl_connect('button_press_event', self.on_plot_click)
+
         self.running = False
 
     def load_patterns(self):
@@ -324,7 +409,148 @@ class RNGFluctuationMeter:
         print(f"Added Note: {note_text}")
 
     def get_random_bit(self):
-        return int.from_bytes(os.urandom(1), "big") & 1
+        return self.entropy_source.read_bit()
+
+    def set_source_os(self):
+        if self.entropy_source:
+            self.entropy_source.close()
+        self.entropy_source = OsEntropySource()
+        self.entropy_source.open()
+        print("Switched to OS Entropy Source")
+
+    def set_source_esp32(self):
+        if self.entropy_source:
+            self.entropy_source.close()
+        self.entropy_source = Esp32NodeSource()
+        self.entropy_source.open()
+        print("Switched to ESP32 Node Source")
+
+    def open_firmware_gen(self):
+        """Show a dialog to generate ESP32 firmware"""
+        self.root.update() # Force refresh before first dialog
+        ssid = simpledialog.askstring("Firmware Gen", "Wi-Fi SSID:")
+        if not ssid: return
+        
+        self.root.update() # Force refresh to show next dialog
+        pwd = simpledialog.askstring("Firmware Gen", "Wi-Fi Password:", show='*')
+        if pwd is None: return
+        
+        self.root.update()
+        host = simpledialog.askstring("Firmware Gen", "Host IP (your PC):", initialvalue="192.168.1.100")
+        if not host: return
+        
+        path = firmware_gen.generate_firmware(ssid, pwd, host)
+        mbox.showinfo("Success", f"Firmware code generated at:\n{path}\n\nFlash this to your ESP32 via Arduino IDE.")
+
+    def open_waterfall_popup(self):
+        """Open waterfall in separate window with extended lookback"""
+        if self.waterfall_popup is not None:
+            try: self.waterfall_popup.lift(); return
+            except: self.waterfall_popup = None
+
+        popup = tk.Toplevel(self.root)
+        popup.title("Frequency Morphing - Extended Spectrum View")
+        popup.geometry("1400x900")
+        popup.configure(bg="#121212")
+
+        # F11 for Fullscreen
+        popup.attributes('-fullscreen', False)
+        popup.bind('<F11>', lambda e: popup.attributes('-fullscreen', not popup.attributes('-fullscreen')))
+        popup.bind('<Escape>', lambda e: popup.attributes('-fullscreen', False))
+
+        controls = tk.Frame(popup, bg="#1e1e1e")
+        controls.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+
+        tk.Label(controls, text="Lookback (Sec):", bg="#1e1e1e", fg="#aaaaaa").pack(side=tk.LEFT)
+        depth_var = tk.IntVar(value=300)
+        depth_scale = tk.Scale(controls, from_=100, to=3600, orient=tk.HORIZONTAL,
+                              variable=depth_var, bg="#2d2d2d", fg="white", length=200,
+                              command=lambda v: self.resize_waterfall(int(v), popup))
+        depth_scale.set(300)
+        depth_scale.pack(side=tk.LEFT, padx=10)
+
+        tk.Label(controls, text="Colormap:", bg="#1e1e1e", fg="#aaaaaa").pack(side=tk.LEFT, padx=(20, 0))
+        popup_cmap = tk.OptionMenu(controls, self.cmap_var, 
+                                   "viridis", "plasma", "inferno", "magma", "cividis",
+                                   "twilight", "cool", "winter", "ocean",
+                                   command=self.update_colormap)
+        popup_cmap.config(bg="#2d2d2d", fg="white", highlightthickness=0)
+        popup_cmap.pack(side=tk.LEFT, padx=5)
+
+        tk.Label(controls, text="Press F11 for Fullscreen", bg="#1e1e1e", fg="#00ff00").pack(side=tk.RIGHT, padx=10)
+
+        popup_fig = Figure(figsize=(14, 8), dpi=100, facecolor='#121212')
+        popup_ax = popup_fig.add_subplot(111, facecolor='#1e1e1e')
+        
+        # Extended data buffer for popup
+        popup.waterfall_data = np.zeros((300, self.waterfall_bins))
+        
+        curr_cmap = self.cmap_var.get()
+        if self.reverse_var.get():
+            curr_cmap += "_r"
+            
+        popup.waterfall_img = popup_ax.imshow(popup.waterfall_data, aspect='auto', cmap=curr_cmap,
+                             extent=[0, self.waterfall_bins, 0, 300], origin='lower', interpolation='bilinear')
+        popup_ax.set_title("Long-term Spectral Evolution", color='white', fontsize=14)
+        popup_ax.tick_params(colors='white')
+        popup_fig.colorbar(popup.waterfall_img, ax=popup_ax, label='Relative Power')
+        
+        popup_canvas = FigureCanvasTkAgg(popup_fig, master=popup)
+        popup_canvas.draw()
+        popup_canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        popup.waterfall_canvas = popup_canvas
+        popup.waterfall_ax = popup_ax
+        self.waterfall_popup = popup
+
+        def on_close():
+            self.waterfall_popup = None
+            try:
+                popup.destroy()
+            except:
+                pass
+        popup.protocol("WM_DELETE_WINDOW", on_close)
+
+    def resize_waterfall(self, new_depth, popup):
+        """Resize the vertical depth of the waterfall storage and display"""
+        if not popup: return
+        old_data = popup.waterfall_data
+        new_data = np.zeros((new_depth, self.waterfall_bins))
+        copy_rows = min(old_data.shape[0], new_depth)
+        new_data[-copy_rows:] = old_data[-copy_rows:]
+        
+        popup.waterfall_data = new_data
+        popup.waterfall_img.set_data(new_data)
+        popup.waterfall_img.set_extent([0, self.waterfall_bins, 0, new_depth])
+        popup.waterfall_ax.set_ylim(0, new_depth)
+        popup.waterfall_canvas.draw()
+
+    def set_waterfall_bins(self, new_bins):
+        """Update the frequency resolution/range shown"""
+        self.waterfall_bins = new_bins
+        # Re-init main waterfall data
+        rows = self.waterfall_data.shape[0]
+        self.waterfall_data = np.zeros((rows, self.waterfall_bins))
+        self.waterfall_img.set_data(self.waterfall_data)
+        self.waterfall_img.set_extent([0, self.waterfall_bins, 0, rows])
+        
+        if self.waterfall_popup:
+            prows = self.waterfall_popup.waterfall_data.shape[0]
+            self.waterfall_popup.waterfall_data = np.zeros((prows, self.waterfall_bins))
+            self.waterfall_popup.waterfall_img.set_data(self.waterfall_popup.waterfall_data)
+            self.waterfall_popup.waterfall_img.set_extent([0, self.waterfall_bins, 0, prows])
+        
+        # Reset FFT baseline for anomaly detection to prevent shape mismatch
+        self.fft_baseline_mean = None
+        self.fft_baseline_var = None
+        
+        # Clear signal buffer too to force a fresh FFT window
+        self.signal_buffer.clear()
+
+    def on_plot_click(self, event):
+        """Handle clicks on the plots - if clicking waterfall, pop it out"""
+        if event.inaxes == self.ax3:
+            self.open_waterfall_popup()
 
     def reset_walk(self):
         self.cumulative_val = 0
@@ -351,8 +577,18 @@ class RNGFluctuationMeter:
         cmap_name = self.cmap_var.get()
         if self.reverse_var.get():
             cmap_name = cmap_name + "_r"
+        
+        # Update main window
         self.waterfall_img.set_cmap(cmap_name)
-        self.canvas.draw()
+        self.canvas.draw_idle()
+        
+        # Update popup window if it exists (Tethered)
+        if self.waterfall_popup:
+            try:
+                self.waterfall_popup.waterfall_img.set_cmap(cmap_name)
+                self.waterfall_popup.waterfall_canvas.draw_idle()
+            except:
+                self.waterfall_popup = None
 
     def update(self):
         if not self.running:
@@ -360,10 +596,25 @@ class RNGFluctuationMeter:
 
         # 1. Generate Data
         now = time.time()
+        
+        # Timing Diagnostic
+        dt = now - self.last_tick_time
+        self.tick_deltas.append(dt)
+        self.last_tick_time = now
+        
         new_bits = []
         for _ in range(BITS_PER_TICK):
             b = self.get_random_bit()
-            self.window.append(b)
+            if b is None:
+                # If even one bit is missing from hardware, pause this tick
+                # Update status immediately to show stoppage
+                self.label.config(text=f"SOURCE: {self.entropy_source.get_name()} | !! NO DATA !!", fg="#ff0000")
+                self.root.after(UPDATE_MS, self.update)
+                return 
+
+            
+            if b is not None:
+                self.window.append(b)
             self.bit_stream.append(b)
             signal_val = 2*b - 1  # ±1 for signal processing
             new_bits.append(signal_val)
@@ -398,8 +649,10 @@ class RNGFluctuationMeter:
                     self.recent_patterns.appendleft(msg)
 
         # 3. Other Patterns: Autocorrelation & Streaks
-        if len(self.window) == WINDOW_SIZE:
-            p = sum(self.window) / WINDOW_SIZE
+        # Filter None values to prevent crash
+        valid_window = [x for x in self.window if x is not None]
+        if len(valid_window) == WINDOW_SIZE:
+            p = sum(valid_window) / WINDOW_SIZE
             
             # Autocorrelation (normalized)
             signal = np.array(self.window) * 2 - 1  # ±1
@@ -447,49 +700,84 @@ class RNGFluctuationMeter:
 
             # 5. Frequency Morphing Waterfall \u0026 Anomaly Detection
             # Compute PSD using Welch's method for long-term frequency tracking
-            if len(self.signal_buffer) >= 512:
-                signal = np.array(list(self.signal_buffer)[-512:])
+            if len(self.signal_buffer) >= max(512, self.waterfall_bins * 8):
+                fft_buffer_size = max(512, self.waterfall_bins * 8)
+                signal = np.array(list(self.signal_buffer)[-fft_buffer_size:])
                 
-                # Welch's method for power spectral density (more stable than raw FFT)
-                freqs, psd = welch(signal, nperseg=128, noverlap=64, nfft=256)
+                # Use nfft based on bins to get appropriate resolution
+                nfft_val = max(256, self.waterfall_bins * 4)
+                freqs, psd = welch(signal, nperseg=nfft_val//2, noverlap=nfft_val//4, nfft=nfft_val)
+                
+                # Keep only what we need for the waterfall display
+                psd_view = psd[:self.waterfall_bins]
+                freqs_view = freqs[:self.waterfall_bins]
                 
                 # NEW: FFT-domain anomaly detection hook
-                self.detect_fft_anomalies(freqs[:64], psd[:64], now)
+                self.detect_fft_anomalies(freqs_view, psd_view, now)
                 
                 # Store in long-term DB
                 self.fft_history_db.append({
                     'timestamp': now,
-                    'freqs': freqs[:64],  # Keep first 64 bins
-                    'psd': psd[:64]
+                    'freqs': freqs_view.copy(),
+                    'psd': psd_view.copy()
                 })
                 
-                # Update waterfall display
-                psd_norm = (psd[:64] - psd[:64].min()) / (psd[:64].max() - psd[:64].min() + 1e-10)
+                # Auto-center stabilization: subtract rolling mean if enabled
+                if getattr(self, 'auto_center_waterfall', False) and self.fft_baseline_mean is not None:
+                    # Resize baseline if bins changed
+                    if len(self.fft_baseline_mean) != len(psd_view):
+                        self.fft_baseline_mean = psd_view.copy()
+                        self.fft_baseline_var = np.ones_like(psd_view) * 1e-6
+                    
+                    # Show deviation from mean (stabilized view)
+                    psd_norm = psd_view - self.fft_baseline_mean
+                    # Re-normalize for visibility
+                    psd_norm = (psd_norm - psd_norm.min()) / (psd_norm.max() - psd_norm.min() + 1e-10)
+                else:
+                    # Absolute power normalization
+                    psd_norm = (psd_view - psd_view.min()) / (psd_view.max() - psd_view.min() + 1e-10)
+                
+                # Update main waterfall
                 self.waterfall_data = np.roll(self.waterfall_data, -1, axis=0)
                 self.waterfall_data[-1, :] = psd_norm
                 self.waterfall_img.set_data(self.waterfall_data)
                 
+                # Update popup waterfall if open
+                if self.waterfall_popup:
+                    try:
+                        self.waterfall_popup.waterfall_data = np.roll(self.waterfall_popup.waterfall_data, -1, axis=0)
+                        self.waterfall_popup.waterfall_data[-1, :] = psd_norm
+                        self.waterfall_popup.waterfall_img.set_data(self.waterfall_popup.waterfall_data)
+                        self.waterfall_popup.waterfall_canvas.draw_idle()
+                    except:
+                        self.waterfall_popup = None
+                
                 # Calculate frequency drift (dominant frequency movement)
                 if len(self.fft_history_db) >= 2:
                     # Find dominant frequency in current and previous
-                    curr_dom = freqs[np.argmax(psd[:64])]
+                    curr_dom = freqs_view[np.argmax(psd_view)]
                     prev_psd = self.fft_history_db[-2]['psd']
                     prev_freqs = self.fft_history_db[-2]['freqs']
-                    prev_dom = prev_freqs[np.argmax(prev_psd)]
                     
-                    # Drift rate in Hz per second
-                    time_diff = now - self.fft_history_db[-2]['timestamp']
-                    if time_diff > 0:
-                        drift_rate = (curr_dom - prev_dom) / time_diff
-                        self.drift_label.config(text=f"Freq Drift: {drift_rate:.4f} Hz/s")
+                    # Safety check for bin count changes
+                    if len(prev_psd) == len(psd_view):
+                        prev_dom = prev_freqs[np.argmax(prev_psd)]
                         
-                        # Color code the drift label
-                        if abs(drift_rate) > 0.1:
-                            self.drift_label.config(fg="#ff0000")  # Red = high drift
-                        elif abs(drift_rate) > 0.01:
-                            self.drift_label.config(fg="#ffaa00")  # Orange = moderate
-                        else:
-                            self.drift_label.config(fg="#00ff00")  # Green = stable
+                        # Drift rate in Hz per second
+                        time_diff = now - self.fft_history_db[-2]['timestamp']
+                        if time_diff > 0:
+                            drift_rate = (curr_dom - prev_dom) / time_diff
+                            self.drift_label.config(text=f"Freq Drift: {drift_rate:.4f} Hz/s")
+                            
+                            # Color code the drift label
+                            if abs(drift_rate) > 0.1:
+                                self.drift_label.config(fg="#ff0000")  # Red = high drift
+                            elif abs(drift_rate) > 0.01:
+                                self.drift_label.config(fg="#ffaa00")  # Orange = moderate
+                            else:
+                                self.drift_label.config(fg="#00ff00")  # Green = stable
+                    else:
+                        self.drift_label.config(text="Freq Drift: --- Hz/s", fg="#555555")
             
             # ANOMALY DETECTION & LOGGING (with debouncing to prevent spam)
             anomalies = []
@@ -576,7 +864,29 @@ class RNGFluctuationMeter:
                 if len(target_tree.get_children()) > 100:
                     target_tree.delete(target_tree.get_children()[-1])
 
-            # 6. Handle Axis Scrolling
+            if len(self.anomaly_db) > 100 or len(self.fft_history_db) > 100:
+                self.flush_to_db()
+
+            # 6. Update Node Status UI (if using ESP32)
+            if isinstance(self.entropy_source, Esp32NodeSource):
+                stats = self.entropy_source.get_node_stats()
+                # Clear and repopulate or sync
+                # For simplicity, we'll refresh the list every tick
+                existing_items = {self.node_tree.item(item)['values'][0]: item for item in self.node_tree.get_children()}
+                
+                for node_id, data in stats.items():
+                    node_hex = hex(node_id)
+                    last_seen_str = time.strftime("%H:%M:%S", time.localtime(data['last_seen']))
+                    bitrate_str = f"{data['bitrate']:.1f} b/s"
+                    source_ip = data.get('ip', 'Unknown')
+                    status = "ONLINE" if (now - data['last_seen']) < 4.0 else "OFFLINE"
+                    
+                    if node_hex in existing_items:
+                        self.node_tree.item(existing_items[node_hex], values=(node_hex, status, bitrate_str, last_seen_str, source_ip))
+                    else:
+                        self.node_tree.insert('', tk.END, values=(node_hex, status, bitrate_str, last_seen_str, source_ip))
+
+            # 7. Handle Axis Scrolling
             self.ax1.set_xlim(min(time_deltas) if time_deltas else -10, 0)
             self.ax2.set_xlim(min(time_deltas) if time_deltas else -10, 0)
             self.ax3.set_ylim(0, 100)  # Fixed time depth for waterfall
@@ -596,12 +906,28 @@ class RNGFluctuationMeter:
             if entropy < 0.95: status = "ORDERED?"
             if entropy < 0.80: status = "SYNCHRONICITY!"
 
-            diag_text = f"p(1): {p:.4f} | Entropy: {entropy:.4f} | {status}\n"
+            source_name = self.entropy_source.get_name()
+            starvation_warn = ""
+            if hasattr(self.entropy_source, 'starvation_count') and self.entropy_source.starvation_count > 0:
+                if (int(now * 2) % 2) == 0: # Faster flashing
+                    starvation_warn = " | !! NO ESP32 DATA !!"
+            
+            diag_text = f"SOURCE: {source_name}{starvation_warn}\n"
+            diag_text += f"p(1): {p:.4f} | Entropy: {entropy:.4f} | {status}\n"
             diag_text += f"Walk: {self.cumulative_val} | Log: {os.path.basename(self.log_path or '')}\n"
             diag_text += f"{chi_str} | {auto_str} | {streak_str}\n"
-            if self.recent_patterns:
-                diag_text += f"Latest: {self.recent_patterns[0]}"
+            # Fluctuation Diagnostic readout
+            avg_dt = np.mean(self.tick_deltas) if self.tick_deltas else 0.05
+            actual_bps = (BITS_PER_TICK / avg_dt) if avg_dt > 0 else 0
+            diag_text += f"Tick Δ: {avg_dt*1000:.1f}ms | Actual: {actual_bps:.1f} bps\n"
+            
             self.label.config(text=diag_text)
+            
+            # Flash label red if starving
+            if starvation_warn:
+                self.label.config(fg="#ff0000")
+            else:
+                self.label.config(fg="#00ff00")
 
             # Update Magnitude Bar
             norm_dev = abs(self.cumulative_val) / WALK_MAX_VIS
@@ -640,7 +966,7 @@ class RNGFluctuationMeter:
             return
 
         # Initialize baseline on first call
-        if self.fft_baseline_mean is None:
+        if self.fft_baseline_mean is None or len(self.fft_baseline_mean) != len(psd):
             self.fft_baseline_mean = psd.copy()
             self.fft_baseline_var = np.ones_like(psd) * 1e-6
             return
@@ -662,11 +988,42 @@ class RNGFluctuationMeter:
         spectral_entropy = -np.sum(psd_norm * np.log2(psd_norm + 1e-12))
         
         # 2. Band Power Ratios (low/mid/high frequency energy distribution)
-        low_band = np.sum(psd[:16])    # Bins 0-15
-        mid_band = np.sum(psd[16:48])  # Bins 16-47
-        high_band = np.sum(psd[48:])   # Bins 48-63
+        num_bins = len(psd)
+        q1, q3 = num_bins // 4, 3 * num_bins // 4
+        low_band = np.sum(psd[:q1])
+        mid_band = np.sum(psd[q1:q3])
+        high_band = np.sum(psd[q3:])
         total_power = low_band + mid_band + high_band + 1e-12
         band_ratio = (low_band / total_power, mid_band / total_power, high_band / total_power)
+        
+        # Track mid-band power for oscillation detection
+        self.mid_band_history.append(mid_band / total_power)
+        
+        # Periodically check for slow oscillations (e.g. 100s period)
+        if now - self.last_osc_check > 10.0 and len(self.mid_band_history) > 2000:
+            self.last_osc_check = now
+            # Use autocorrelation on the power signal to find periodicities
+            m_data = np.array(self.mid_band_history)
+            m_data = m_data - np.mean(m_data) # Zero-center
+            
+            # Look for 100s peak (at ~20Hz updates, 100s is lag 2000)
+            # We check a range around 100s
+            search_window = 500 # Look at lags 1500 to 2500
+            if len(m_data) > 2500:
+                acorr = correlate(m_data, m_data, mode='full')
+                acorr = acorr[len(acorr)//2:] # Positive lags
+                # Normalize
+                acorr /= acorr[0]
+                
+                # Search for peak around 100s (lag 2000)
+                sub_acorr = acorr[1500:2500]
+                max_lag_idx = np.argmax(sub_acorr)
+                max_val = sub_acorr[max_lag_idx]
+                
+                if max_val > 0.4: # Significant periodic logic
+                    detected_period = (max_lag_idx + 1500) * (UPDATE_MS / 1000.0)
+                    self.stat_tree.insert('', 0, values=(time.strftime("%H:%M:%S"), "OSC-DET", f"MidBand {detected_period:.1f}s cycle"))
+                    print(f"DEBUG: Found oscillation at {detected_period:.1f}s period (val={max_val:.3f})")
         
         # 3. Peak Bin Indices (top 3 strongest frequencies)
         peak_bins = np.argsort(psd)[-3:][::-1]  # Descending order
@@ -787,57 +1144,83 @@ class RNGFluctuationMeter:
             self.update()
         else:
             self.btn.config(text="START", bg="#008000")
-            # Stop Logging & Export JSON
-            if self.current_log_file:
-                self.current_log_file.close()
-                self.current_log_file = None
-                self.current_csv_writer = None
+            # Stop Logging & Export JSON (Backgrounded)
+            log_path_copy = self.log_path
+            csv_file_copy = self.current_log_file
             
-            # Export Walk Data
-            export_path = self.log_path.replace('.csv', '.json')
-            export_data = {
-                'timestamps': list(self.timestamps),
-                'cumulative_history': list(self.cumulative_history),
-                'p_history': list(self.p_history),
-                'patterns_history': self.patterns_history
-            }
-            with open(export_path, 'w') as f:
-                json.dump(export_data, f)
-            print(f"Exported walk data to {export_path}")
+            self.current_log_file = None
+            self.current_csv_writer = None
             
-            # Save long-term anomaly and FFT data
-            self.save_longterm_data()
+            def final_save():
+                if csv_file_copy:
+                    csv_file_copy.close()
+                
+                # Export Walk Data
+                export_path = log_path_copy.replace('.csv', '.json')
+                export_data = {
+                    'timestamps': list(self.timestamps),
+                    'cumulative_history': list(self.cumulative_history),
+                    'p_history': list(self.p_history),
+                    'patterns_history': self.patterns_history
+                }
+                with open(export_path, 'w') as f:
+                    json.dump(export_data, f)
+                
+                # Final flush of current memory buffers
+                self.flush_to_db()
+                self.save_patterns()
+                print(f"Final data export to {export_path} complete.")
+
+            threading.Thread(target=final_save, daemon=True).start()
+
+    def flush_to_db(self):
+        """Move current memory buffers to SQLite and clear them to prevent RAM bloat"""
+        if not self.anomaly_db and not self.fft_history_db:
+            return
             
-            self.save_patterns()
+        anomalies_to_save = list(self.anomaly_db)
+        fft_to_save = list(self.fft_history_db)
+        
+        self.anomaly_db.clear()
+        self.fft_history_db.clear()
+        
+        def save_task():
+            db_path = os.path.join(LOG_DIR, "rng_longterm.db")
+            try:
+                conn = sqlite3.connect(db_path)
+                c = conn.cursor()
+                
+                # Create tables
+                c.execute('''CREATE TABLE IF NOT EXISTS anomalies
+                             (timestamp REAL, type TEXT, details TEXT, p REAL, entropy REAL, walk INTEGER)''')
+                c.execute('''CREATE TABLE IF NOT EXISTS fft_history
+                             (timestamp REAL, freq_bin INTEGER, power REAL)''')
+                
+                # Store anomalies
+                for anomaly in anomalies_to_save:
+                    c.execute("INSERT INTO anomalies VALUES (?, ?, ?, ?, ?, ?)",
+                             (anomaly['timestamp'], anomaly['type'], anomaly['details'],
+                              anomaly['p'], anomaly['entropy'], anomaly['walk']))
+                
+                # Store FFT spectra (downsampled to save space)
+                for record in fft_to_save:
+                    for i, (freq, power) in enumerate(zip(record['freqs'], record['psd'])):
+                        if i % 4 == 0:  # Store every 4th bin to save space
+                            c.execute("INSERT INTO fft_history VALUES (?, ?, ?)",
+                                     (record['timestamp'], freq, power))
+                
+                conn.commit()
+                conn.close()
+                # print(f"Flushed {len(anomalies_to_save)} anomalies and {len(fft_to_save)} FFT records to disk.")
+            except Exception as e:
+                print(f"Error flushing to DB: {e}")
+
+        # Run save in background thread
+        threading.Thread(target=save_task, daemon=True).start()
 
     def save_longterm_data(self):
-        """Save anomalies and FFT history to SQLite"""
-        db_path = os.path.join(LOG_DIR, "rng_longterm.db")
-        conn = sqlite3.connect(db_path)
-        c = conn.cursor()
-        
-        # Create tables
-        c.execute('''CREATE TABLE IF NOT EXISTS anomalies
-                     (timestamp REAL, type TEXT, details TEXT, p REAL, entropy REAL, walk INTEGER)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS fft_history
-                     (timestamp REAL, freq_bin INTEGER, power REAL)''')
-        
-        # Store anomalies
-        for anomaly in self.anomaly_db:
-            c.execute("INSERT INTO anomalies VALUES (?, ?, ?, ?, ?, ?)",
-                     (anomaly['timestamp'], anomaly['type'], anomaly['details'],
-                      anomaly['p'], anomaly['entropy'], anomaly['walk']))
-        
-        # Store FFT spectra (downsampled to save space)
-        for record in self.fft_history_db:
-            for i, (freq, power) in enumerate(zip(record['freqs'], record['psd'])):
-                if i % 4 == 0:  # Store every 4th bin to save space
-                    c.execute("INSERT INTO fft_history VALUES (?, ?, ?)",
-                             (record['timestamp'], freq, power))
-        
-        conn.commit()
-        conn.close()
-        print(f"Saved {len(self.anomaly_db)} anomalies and {len(self.fft_history_db)} FFT records to {db_path}")
+        # Redirected to flush_to_db() which is non-blocking
+        self.flush_to_db()
 
 if __name__ == "__main__":
     root = tk.Tk()
